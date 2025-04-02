@@ -55,6 +55,8 @@ struct SubalphaNgDeviceOperation {
             const operation_attributes_t& operation_attributes,
             const tensor_args_t& tensor_args,
             tensor_return_value_t& output);
+
+        static std::string get_reader_compute_kernel_file_path(KernelName kernel_name, bool is_sfpu);
     };
 
     using program_factory_t = std::variant<SubalphaProgramFactory>;

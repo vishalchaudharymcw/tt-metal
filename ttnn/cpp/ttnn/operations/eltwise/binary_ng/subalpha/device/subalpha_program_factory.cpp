@@ -160,8 +160,8 @@ public:
         // for eltwise, it should be insignificant to process the padded tile although it is a waste
         if (core == end_core) {
             if (memory_layout == TensorMemoryLayout::HEIGHT_SHARDED) {
-                current_shape[majorDim] = last_shard_shape[majorDim];
-                current_shape[minorDim] = last_shard_shape[minorDim];
+            current_shape[majorDim] = last_shard_shape[majorDim];
+            current_shape[minorDim] = last_shard_shape[minorDim];
             } else {
                 TT_FATAL(
                     current_shape[majorDim] == last_shard_shape[majorDim] and
@@ -209,7 +209,7 @@ void set_or_update_runtime_arguments(
     bool zero_start_grid = false;
     CoreCoord compute_with_storage_grid;
     const auto& all_device_cores = operation_attributes.worker_grid;
-    if (grid.size() == 1) {
+    if (all_device_cores.size() == 1) {
         const auto& cr = *all_device_cores.ranges().begin();
         if (cr.start_coord.x == 0 && cr.start_coord.y == 0) {
             if (has_sharding) {
@@ -363,6 +363,26 @@ void set_or_update_runtime_arguments(
 
 namespace ttnn::operations::binary_ng {
 
+    std::string SubalphaNgDeviceOperation::SubalphaProgramFactory::get_reader_compute_kernel_file_path(KernelName kernel_name, bool is_sfpu) {
+        constexpr std::string_view root = "ttnn/cpp/ttnn/operations/eltwise/binary_ng/subalpha/device/kernels";
+        constexpr std::string_view dataflow = "{}/dataflow/{}";
+        constexpr std::string_view compute = "{}/compute/{}";
+
+        switch (kernel_name) {
+            case KernelName::ReaderNoBcast: return fmt::format(dataflow, root, "reader_interleaved_no_bcast.cpp");
+            case KernelName::ReaderRowBcast: return fmt::format(dataflow, root, "reader_interleaved_row_bcast.cpp");
+            case KernelName::ReaderColBcast: return fmt::format(dataflow, root, "reader_interleaved_col_bcast.cpp");
+            case KernelName::ReaderScalarBcast: return fmt::format(dataflow, root, "reader_interleaved_scalar_bcast.cpp");
+            case KernelName::ComputeNoBcast:
+                return fmt::format(
+                    compute, root, /*is_sfpu ? "eltwise_subalpha_sfpu_no_bcast.cpp" :*/ "eltwise_subalpha_no_bcast.cpp");
+            case KernelName::ComputeBcast:
+                return fmt::format(compute, root, /*is_sfpu ? "eltwise_subalpha_sfpu.cpp" :*/ "eltwise_subalpha.cpp");
+            case KernelName::ComputeScalar:
+                return fmt::format(compute, root, /*is_sfpu ? "eltwise_subalpha_sfpu_scalar.cpp" : */"eltwise_subalpha_scalar.cpp");
+            default: __builtin_unreachable();  // GCC 12 doesn't compile even though we exhaustively match
+        }
+    }
 // Implements c = a op b
 SubalphaNgDeviceOperation::SubalphaProgramFactory::cached_program_t SubalphaNgDeviceOperation::SubalphaProgramFactory::create(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args, tensor_return_value_t& c) {
@@ -394,6 +414,7 @@ SubalphaNgDeviceOperation::SubalphaProgramFactory::cached_program_t SubalphaNgDe
     uint32_t c_single_tile_size = tt_metal::detail::TileSize(c_data_format);
 
     // we parallelize the computation across the output tiles
+    constexpr bool row_major = true;
     const auto& all_device_cores = operation_attributes.worker_grid;
 
     Buffer* a_buffer = a.buffer();
@@ -472,10 +493,10 @@ SubalphaNgDeviceOperation::SubalphaProgramFactory::cached_program_t SubalphaNgDe
     reader_defines["SRC_SHARDED"] = a_sharded ? "1" : "0";
 
     // READER KERNEL
-    std::string reader_subalpha_kernel_filepath = "ttnn/cpp/ttnn/operations/eltwise/binary_ng/subalpha/device/kernels/dataflow/reader_interleaved_no_bcast.cpp";
+    std::string reader_subalpha_kernel_filepath = get_reader_compute_kernel_file_path(kernel_config.reader_kernel, is_sfpu_op);
     auto reader_kernel_id = tt_metal::CreateKernel(
         program,
-        reader_subalpha_kernel_filepath,
+        get_reader_compute_kernel_file_path(kernel_config.reader_kernel, is_sfpu_op),
         all_device_cores,
         tt_metal::ReaderDataMovementConfig({a_is_dram, has_sharding}, std::move(reader_defines)));
 
@@ -513,24 +534,17 @@ SubalphaNgDeviceOperation::SubalphaProgramFactory::cached_program_t SubalphaNgDe
     }
 
     compute_kernel_defines["BCAST_INPUT"] = kernel_config.bcast_input_str();
-
+    std::string compute_subalpha_kernel_filepath = get_reader_compute_kernel_file_path(compute_kernel, is_sfpu_op);
     const uint32_t num_tiles_per_cycle = 1;  // we produce 1 output tile per read-compute-write cycle
-    std::string compute_subalpha_kernel_filepath;
-    if(kernel_config.compute_kernel == KernelName::ComputeNoBcast){
-        compute_subalpha_kernel_filepath = "ttnn/cpp/ttnn/operations/eltwise/binary_ng/subalpha/device/kernels/compute/eltwise_subalpha_no_bcast.cpp";
-    }
-    else{
-       TT_THROW("Unexpected KernelName encountered in subalpha compute kernel !!");
-    }
     auto compute_kernel_id = tt_metal::CreateKernel(
         program,
-        compute_subalpha_kernel_filepath,
+        get_reader_compute_kernel_file_path(compute_kernel, is_sfpu_op),
         all_device_cores,
         tt_metal::ComputeConfig{
             .fp32_dest_acc_en = fp32_dest_acc_en,
             .unpack_to_dest_mode = std::move(unpack_to_dest_mode),
+            .compile_args = {num_tiles_per_cycle},
             .defines = std::move(compute_kernel_defines)});
-
     auto set_runtime_args = [](Program& program, KernelHandle kernel_id, CoreCoord core, auto&& args) {
         tt_metal::SetRuntimeArgs(program, kernel_id, core, args);
     };
